@@ -68,7 +68,6 @@ target_link_libraries(pplx_kernels PUBLIC
     CUDA::cuda_driver
     CUDA::cudart
     nvshmem::nvshmem_host
-    nvshmem::nvshmem_bootstrap_uid
     nvshmem::nvshmem_device
 )
 set_target_properties(pplx_kernels PROPERTIES
