@@ -1,5 +1,9 @@
+#ifdef USE_ROCM
+#include "core/hip_dist_defs.h"
 
+#else
 #include <nvshmem.h>
+#endif
 
 #include <cassert>
 #include <cstdint>

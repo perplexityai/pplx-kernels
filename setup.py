@@ -7,6 +7,17 @@ from setuptools.command.build import build as _build
 from setuptools.command.build_ext import build_ext
 
 
+# NOTE(yiakwy)
+from helper_rocm import (
+    ROCM_HOME,
+    _is_hip,
+    target_amdgpu_arch,
+    get_hip_libraries,
+    get_hipcc_flags,
+    get_hipcc_rocm_version,
+)
+
+
 def _get_torch_cmake_prefix_path() -> str:
     import torch
 
@@ -43,7 +54,7 @@ class CMakeBuild(build_ext):
                 "-G",
                 "Ninja",
                 "-DCMAKE_PREFIX_PATH=" + _get_torch_cmake_prefix_path(),
-                "-DTORCH_CUDA_ARCH_LIST=" + os.environ["TORCH_CUDA_ARCH_LIST"],
+                "-DTORCH_CUDA_ARCH_LIST=" + target_amdgpu_arch if _is_hip else os.environ["TORCH_CUDA_ARCH_LIST"],
                 "-WITH_TESTS=OFF",
             ]
         )
@@ -80,7 +91,7 @@ class CleanCommand(Command):
 
 extensions = [
     Extension(
-        "pplx-kernels",
+        "pplx-kernels-rocm",
         sources=[],
     ),
 ]
@@ -89,7 +100,7 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     package_data={
-        "pplx_kernels": ["libpplx_kernels.so", "py.typed"],
+        "pplx-kernels-rocm": ["libpplx_kernels.so", "py.typed"],
     },
     cmdclass={
         "build_ext": CMakeBuild,

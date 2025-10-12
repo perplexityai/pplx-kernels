@@ -10,7 +10,34 @@
 #include <random>
 #include <vector>
 
+#if USE_ROCM
+
+#include <hip/hip_fp8.h>
+
+// NOTE (yiakwy) : __hip_fp8_e4m3_fnuz only represents -240..0..240
+using __nv_fp8_e4m3 = __hip_fp8_e4m3_fnuz;
+
+__hip_fp8_storage_t
+convert_float_to_fp8(float in, /* Input val */
+                    __hip_fp8_interpretation_t
+                        interpret, /* interpretation of number E4M3/E5M2 */
+                    __hip_saturation_t sat /* Saturation behavior */
+) {
+    return __hip_cvt_float_to_fp8(in, sat, interpret);
+}
+
+float convert_fp8_to_float(
+    __hip_fp8_storage_t in, /* Input val */
+    __hip_fp8_interpretation_t
+        interpret /* interpretation of number E4M3/E5M2 */
+) {
+    __half hf = __hip_cvt_fp8_to_halfraw(in, interpret);
+    return static_cast<float>(hf);
+}
+
+#else
 #include <cuda_fp8.h>
+#endif
 
 namespace pplx {
 
@@ -82,7 +109,8 @@ RankTestData<T>::RankTestData(
 
   // Populate the tokens.
   if constexpr (std::is_integral<T>::value) {
-    std::uniform_int_distribution<> value(-256, 256);
+    // std::uniform_int_distribution<> value(-256, 256);
+    std::uniform_int_distribution<> value(-224, 224);
     for (size_t i = 0; i < m; ++i) {
       for (size_t j = 0; j < hiddenDim; ++j) {
         x[i * hiddenDim + j] = value(gen);
@@ -93,7 +121,11 @@ RankTestData<T>::RankTestData(
     for (size_t i = 0; i < m; ++i) {
       for (size_t j = 0; j < hiddenDim; ++j) {
         if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+#if USE_ROCM
+          x[i * hiddenDim + j] = static_cast<__hip_fp8_e4m3_fnuz>(convert_float_to_fp8(value(gen), __HIP_E4M3_FNUZ, __HIP_SATFINITE));
+#else
           x[i * hiddenDim + j] = __nv_cvt_float_to_fp8(value(gen), __NV_SATFINITE, __NV_E4M3);
+#endif
         } else {
           x[i * hiddenDim + j] = value(gen);
         }

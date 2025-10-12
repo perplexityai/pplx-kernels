@@ -1,10 +1,20 @@
 // All-to-all kernel test
+#ifdef USE_ROCM
 
+#include <hip/hip_runtime.h>
+#include <rocprofiler/rocprofiler.h>
+#include <mpi.h>
+#include <rocshmem/rocshmem.hpp>
+
+#include "core/nvshmem_utils.h"
+
+#else
 #include <cuda.h>
 #include <cuda_profiler_api.h>
 #include <mpi.h>
 #include <nvshmem.h>
 #include <nvshmemx.h>
+#endif // USE_ROCM
 
 #include <algorithm>
 #include <iostream>
@@ -12,6 +22,7 @@
 #include <unordered_set>
 
 #include "all_to_all/internode.h"
+
 #include "all_to_all/intranode.h"
 #include "all_to_all/test_utils.h"
 #include "core/buffer.h"
@@ -346,9 +357,52 @@ int main(int argc, char **argv) {
     MPICHECK(MPI_Finalize());
     return EXIT_FAILURE;
   }
-
-  // Set up NVSHMEM.
+  
   MPI_Comm mpi_comm = MPI_COMM_WORLD;
+
+#if USE_ROCM
+  using namespace rocshmem;
+
+  rocshmem_init_attr_t attr;
+  attr.mpi_comm = &mpi_comm;
+
+  NVSHMEMCHECK(rocshmem_init_attr(ROCSHMEM_INIT_WITH_UNIQUEID, &attr));
+  // roc_shmem_init();
+
+  int currentPE = rocshmem_my_pe();
+  int numPEs = rocshmem_n_pes();
+
+  CUDACHECK(hipSetDevice(rank));
+
+  hipStream_t stream;
+  CUDACHECK(hipStreamCreate(&stream));
+
+  // Run the tests.
+  int exit_code = EXIT_SUCCESS; 
+
+  // Intra-node tests.
+  std::shared_ptr<Distributed> distributed = std::make_shared<DistributedNVSHMEM>(rank, world_size);
+  if (!testDispatchCombine<float, AllToAllIntraNode>(
+          stream, rank / 2, 2, rank, world_size, distributed
+      )) {
+    exit_code = EXIT_FAILURE;
+  }
+  if (!testDispatchCombine<__hip_bfloat16, AllToAllIntraNode>(
+          stream, rank / 2, 2, rank, world_size, distributed
+      )) {
+    exit_code = EXIT_FAILURE;
+  }
+
+  // Cleanup.
+  CUDACHECK(hipStreamDestroy(stream));
+
+  rocshmem_barrier_all();
+  rocshmem_finalize();
+
+  MPICHECK(MPI_Finalize());
+  return exit_code;
+#else
+  // Set up NVSHMEM.
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
   attr.mpi_comm = &mpi_comm;
   nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
@@ -391,4 +445,5 @@ int main(int argc, char **argv) {
   nvshmem_finalize();
   MPICHECK(MPI_Finalize());
   return exit_code;
+#endif
 }

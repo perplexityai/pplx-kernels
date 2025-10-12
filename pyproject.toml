@@ -1,7 +1,7 @@
 [project]
-name = "pplx-kernels"
+name = "pplx-kernels-rocm"
 version = "0.0.1"
-description = "Perplexity CUDA Kernels"
+description = "Perplexity HIP/CUDA Kernels"
 readme = "README.md"
 requires-python = ">=3.9"
 
@@ -14,7 +14,7 @@ line-length = 88
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
-known-first-party = ["tests", "pplx_kernels"]
+known-first-party = ["tests", "pplx-kernels-rocm"]
 
 [tool.ruff.lint]
 select = [

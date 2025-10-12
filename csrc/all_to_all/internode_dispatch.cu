@@ -1,18 +1,43 @@
+#include "core/nvshmem_utils.h"
+#include "core/utils.h"
+#include "internode.h"
+
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+
+#include <rocprofiler-sdk-roctx/roctx.h>
+
+#include "core/hip_defs.h"
+#include "core/hip_cuda_dtype_defs.h"
+#include "core/hip_dist_defs.h"
+#include "core/hip_roctx_defs.h"
+
+#else
+
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <nvshmem.h>
 #include <nvtx3/nvToolsExt.h>
 
+#endif // USE_ROCM
+
 #include "all_to_all/internode.h"
+#include "core/common_utils.h"
 #include "core/device_utils.cuh"
 #include "core/utils.h"
 
 using namespace pplx;
 
-namespace {
+#ifdef USE_ROCM
+using namespace rocshmem;
+#define __ldg(...) __builtin_nontemporal_load(__VA_ARGS__)
+#endif 
+
+// namespace {
 
 template <unsigned NUM_WARPS, bool DO_SEND, bool DO_RECV>
-__global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void dispatchKernel(
     int32_t *outNumTokensPerExpert,
     size_t outNumTokensPerExpertStrideElem,
     std::byte *expertX,
@@ -59,7 +84,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
   const unsigned dpRank = rank % dpSize;
   const unsigned tokenDim = hiddenDim + hiddenDimScale;
   const unsigned tokenStride = round_up<unsigned>(tokenDim + sizeof(uint32_t), sizeof(int4));
-  const unsigned WARP_SIZE = 32;
+  // const unsigned WARP_SIZE = 32;
   const unsigned warpId = threadIdx.x / WARP_SIZE;
   const unsigned laneId = threadIdx.x % WARP_SIZE;
 
@@ -101,7 +126,13 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
         uint64_t *dstCount = &numTokensBuffer[dstLocalExpert * numDPGroups + dpGroup];
 
         if (laneId == 0) {
+
+#ifdef USE_ROCM
+          rocshmem_ulong_p((unsigned long *)dstCount, numTokensPerExpert + 1, dstRank);
+#else
           nvshmemx_signal_op(dstCount, numTokensPerExpert + 1, NVSHMEM_SIGNAL_SET, dstRank);
+#endif // USE_ROCM
+
         }
       }
 
@@ -141,7 +172,11 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
           }
 
           // Synchronize the warps within this warp group.
+#if USE_ROCM
+          __syncthreads();
+#else
           asm volatile("bar.sync 1, %0;" ::"r"(numGroupThreads));
+#endif // USE_ROCM
 
           // Send the token to the other ranks, one send per warp.
           for (unsigned j = warpId; j < numExpertsPerToken; j += numGroupWarps) {
@@ -154,6 +189,17 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
             const unsigned loc = group * maxNumTokens + index;
 
             std::byte *destPointer = xBufferOut + loc * tokenStride;
+#if USE_ROCM
+            rocshmem_putmem_signal_nbi_wave(
+                destPointer,
+                xInPtr,
+                tokenStride,
+                &numRecvBuffer[group],
+                1,
+                ROCSHMEM_SIGNAL_ADD,
+                dstRank
+            );
+#else
             nvshmemx_putmem_signal_nbi_warp(
                 destPointer,
                 xInPtr,
@@ -163,6 +209,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
                 NVSHMEM_SIGNAL_ADD,
                 dstRank
             );
+#endif // USE_ROCM
           }
         }
       }
@@ -188,9 +235,19 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
       // Fetch the token count per DP, which is non-zero to indicate receipt.
       // Afterwards, wait for exactly that many tokens to be sent to us.
+#if USE_ROCM
+      rocshmem_ulong_wait_until((unsigned long *)&numTokensBuffer[group], ROCSHMEM_CMP_NE, 0);
+#else
       nvshmem_uint64_wait_until(&numTokensBuffer[group], NVSHMEM_CMP_NE, 0);
+#endif // USE_ROCM
+
       size_t numTokens = numTokensBuffer[group] - 1;
+
+#if USE_ROCM
+      rocshmem_ulong_wait_until((unsigned long *)&numRecvBuffer[group], ROCSHMEM_CMP_EQ, numTokens);
+#else
       nvshmem_uint64_wait_until(&numRecvBuffer[group], NVSHMEM_CMP_EQ, numTokens);
+#endif // USE_ROCM
 
       numTokensPerDP[group] = numTokens;
       numTokensBuffer[group] = 0;
@@ -249,7 +306,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
   }
 }
 
-} // namespace
+// } // namespace
 
 void AllToAllInterNode::dispatch(
     const Strided1D<int32_t> &outNumTokensPerExpert,
@@ -262,7 +319,8 @@ void AllToAllInterNode::dispatch(
     const unsigned *boundM,
     SplitMode splitMode,
     cudaStream_t stream
-) {
+) 
+{
   constexpr unsigned NUM_WARPS = 10;
   const unsigned numBlocks = std::min(
       std::max(
@@ -271,7 +329,7 @@ void AllToAllInterNode::dispatch(
       static_cast<unsigned>(numSMs)
   );
   dim3 dimGrid(numBlocks, 1, 1);
-  dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+  dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
 
   const size_t expertsPerBlock = ceil_div<size_t>(numLocalExperts * numDPGroups, numBlocks);
   const size_t sharedMemorySend = sizeof(uint32_t) * numExperts;

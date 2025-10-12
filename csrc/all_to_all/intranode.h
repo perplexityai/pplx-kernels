@@ -6,7 +6,11 @@
 #include <memory>
 #include <vector>
 
+#ifdef USE_ROCM
+#include "core/hip_cuda_dtype_defs.h"
+#else
 #include <cuda_bf16.h>
+#endif // USE_ROCM
 
 #include "all_to_all/all_to_all.h"
 #include "core/buffer.h"

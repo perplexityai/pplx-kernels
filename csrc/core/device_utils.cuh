@@ -26,6 +26,11 @@ template <typename Kernel> struct enable_sm90_or_later : Kernel {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 900
     Kernel::operator()(std::forward<Args>(args)...);
 #endif
+
+#if defined __HIPCC__
+    Kernel::operator()(std::forward<Args>(args)...);
+#endif
+
   }
 };
 

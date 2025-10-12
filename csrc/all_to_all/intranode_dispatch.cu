@@ -4,9 +4,26 @@
 #include "core/utils.h"
 #include "intranode.h"
 
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+
+#include <rocprofiler-sdk-roctx/roctx.h>
+
+#include "core/hip_defs.h"
+#include "core/hip_roctx_defs.h"
+
+#define FULL_MASK 0xffffffffffffffff
+
+#else
+
 #include <cooperative_groups.h>
 #include <cuda.h>
 #include <nvtx3/nvToolsExt.h>
+
+#define FULL_MASK 0xffffffff
+
+#endif // USE_ROCM
 
 using namespace pplx;
 
@@ -125,7 +142,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
       __syncthreads();
 
       // Send the token to the other ranks, one send per warp.
-      const unsigned WARP_SIZE = 32;
+      // const unsigned WARP_SIZE = 32;
       const unsigned warpId = threadIdx.x / WARP_SIZE;
       const unsigned laneId = threadIdx.x % WARP_SIZE;
       for (unsigned j = warpId; j < numExpertsPerToken; j += NUM_WARPS) {
@@ -141,7 +158,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
         } else {
           index = 0;
         }
-        index = __shfl_sync(0xffffffff, index, 0);
+        index = __shfl_sync(FULL_MASK, index, 0);
 
         // Copy the token to the shared buffer.
         std::byte *buffer = remoteBuffer.getTokenPtr(dstRank, dstLocalExpert, index);
