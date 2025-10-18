@@ -5,6 +5,7 @@ Features:
 * ✅ Cuda Graph support
 * ✅ Flexible transportation layers: NVLink, IBGDA, IBRC, EFA
 * ✅ Overlapping communication and computation
+* ✅ Stable releases with semantic versioning
 
 ## System Requirements
 
@@ -12,11 +13,41 @@ To learn how to set up the system drivers and dependencies, refer to the [Instal
 
 ## Installation
 
+### Using Stable Releases (Recommended)
+
+With stable releases, you can now pin to specific versions instead of commit SHAs:
+
 ```bash
+# Install latest stable release
+pip install git+https://github.com/perplexityai/pplx-kernels.git
+
+# Install specific version
+pip install git+https://github.com/perplexityai/pplx-kernels.git@v0.1.0
+```
+
+For use in `requirements.txt`:
+```
+# Pin to specific stable version
+git+https://github.com/perplexityai/pplx-kernels.git@v0.1.0
+
+# Or use latest release
+git+https://github.com/perplexityai/pplx-kernels.git
+```
+
+### Development Installation
+
+For development or building from source:
+
+```bash
+git clone https://github.com/perplexityai/pplx-kernels.git
 cd pplx-kernels
 TORCH_CUDA_ARCH_LIST=9.0a+PTX python3 setup.py bdist_wheel
 pip install dist/*.whl
 ```
+
+## Versioning
+
+This project follows [Semantic Versioning](https://semver.org/). See [CHANGELOG.md](CHANGELOG.md) for version history and [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md) for release information.
 
 ## Single-node Testing and Benchmarking
 
@@ -120,3 +151,7 @@ To run the all-to-all benchmarks on one node:
 ```bash
 NVSHMEM_REMOTE_TRANSPORT=none mpirun -np 4 ./all_to_all/bench_all_to_all
 ```
+
+## Contributing
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md) for information about releases.
