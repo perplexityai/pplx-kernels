@@ -11,45 +11,48 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 
-def get_current_version():
+def get_current_version() -> str:
     """Get current version from pyproject.toml."""
     pyproject_path = Path("pyproject.toml")
     if not pyproject_path.exists():
-        raise FileNotFoundError("pyproject.toml not found")
+        msg = "pyproject.toml not found"
+        raise FileNotFoundError(msg)
     
-    content = pyproject_path.read_text()
+    content = pyproject_path.read_text(encoding="utf-8")
     match = re.search(r'version = "([^"]+)"', content)
     if not match:
-        raise ValueError("Version not found in pyproject.toml")
+        msg = "Version not found in pyproject.toml"
+        raise ValueError(msg)
     
     return match.group(1)
 
 
-def update_version(new_version):
+def update_version(new_version: str) -> None:
     """Update version in pyproject.toml."""
     pyproject_path = Path("pyproject.toml")
-    content = pyproject_path.read_text()
+    content = pyproject_path.read_text(encoding="utf-8")
     
     updated_content = re.sub(
         r'version = "[^"]+"',
         f'version = "{new_version}"',
-        content
+        content,
     )
     
-    pyproject_path.write_text(updated_content)
-    print(f"Updated pyproject.toml version to {new_version}")
+    pyproject_path.write_text(updated_content, encoding="utf-8")
+    print(f"Updated pyproject.toml version to {new_version}")  # noqa: T201
 
 
-def update_changelog(version, changes=None):
+def update_changelog(version: str, changes: Optional[str] = None) -> None:  # noqa: ARG001
     """Update CHANGELOG.md with new version."""
     changelog_path = Path("CHANGELOG.md")
     if not changelog_path.exists():
-        print("CHANGELOG.md not found, skipping changelog update")
+        print("CHANGELOG.md not found, skipping changelog update")  # noqa: T201
         return
     
-    content = changelog_path.read_text()
+    content = changelog_path.read_text(encoding="utf-8")
     today = datetime.now().strftime("%Y-%m-%d")
     
     # Find the [Unreleased] section and add new version
@@ -65,90 +68,125 @@ def update_changelog(version, changes=None):
             new_section = f"## [{version}] - {today}\n\n"
             content = content[:insertion_point] + new_section + content[insertion_point:]
     
-    changelog_path.write_text(content)
-    print(f"Updated CHANGELOG.md with version {version}")
+    changelog_path.write_text(content, encoding="utf-8")
+    print(f"Updated CHANGELOG.md with version {version}")  # noqa: T201
 
 
-def bump_version(current_version, bump_type):
+def bump_version(current_version: str, bump_type: str) -> str:
     """Bump version based on type (major, minor, patch)."""
     parts = current_version.split('.')
     if len(parts) != 3:
-        raise ValueError(f"Invalid version format: {current_version}")
+        msg = f"Invalid version format: {current_version}"
+        raise ValueError(msg)
     
     major, minor, patch = map(int, parts)
     
     if bump_type == "major":
         return f"{major + 1}.0.0"
-    elif bump_type == "minor":
+    if bump_type == "minor":
         return f"{major}.{minor + 1}.0"
-    elif bump_type == "patch":
+    if bump_type == "patch":
         return f"{major}.{minor}.{patch + 1}"
-    else:
-        raise ValueError(f"Invalid bump type: {bump_type}")
+    msg = f"Invalid bump type: {bump_type}"
+    raise ValueError(msg)
 
 
-def create_git_tag(version, push=False):
+def create_git_tag(version: str, *, push: bool = False) -> bool:
     """Create and optionally push git tag."""
     tag = f"v{version}"
     
     # Check if tag already exists
-    result = subprocess.run(["git", "tag", "-l", tag], capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", "tag", "-l", tag],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if result.stdout.strip():
-        print(f"Tag {tag} already exists")
+        print(f"Tag {tag} already exists")  # noqa: T201
         return False
     
     # Create tag
     subprocess.run(["git", "tag", "-a", tag, "-m", f"Release {tag}"], check=True)
-    print(f"Created tag {tag}")
+    print(f"Created tag {tag}")  # noqa: T201
     
     if push:
         subprocess.run(["git", "push", "origin", tag], check=True)
-        print(f"Pushed tag {tag} to origin")
+        print(f"Pushed tag {tag} to origin")  # noqa: T201
     
     return True
 
 
-def commit_changes(version):
+def commit_changes(version: str) -> None:
     """Commit version changes."""
     files = ["pyproject.toml", "CHANGELOG.md"]
     existing_files = [f for f in files if Path(f).exists()]
     
     if not existing_files:
-        print("No files to commit")
+        print("No files to commit")  # noqa: T201
         return
     
-    subprocess.run(["git", "add"] + existing_files, check=True)
-    subprocess.run(["git", "commit", "-m", f"Prepare release v{version}"], check=True)
-    print(f"Committed changes for version {version}")
+    subprocess.run(["git", "add", *existing_files], check=True)
+    subprocess.run(
+        ["git", "commit", "-m", f"Prepare release v{version}"],
+        check=True,
+    )
+    print(f"Committed changes for version {version}")  # noqa: T201
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Release management for pplx-kernels")
-    parser.add_argument("--version", help="Specific version to set (e.g., 1.2.3)")
-    parser.add_argument("--bump", choices=["major", "minor", "patch"], help="Bump version")
-    parser.add_argument("--tag", action="store_true", help="Create git tag")
-    parser.add_argument("--push", action="store_true", help="Push tag to origin")
-    parser.add_argument("--commit", action="store_true", help="Commit changes")
-    parser.add_argument("--current", action="store_true", help="Show current version")
+def main() -> None:
+    """Main function for release management."""
+    parser = argparse.ArgumentParser(
+        description="Release management for pplx-kernels",
+    )
+    parser.add_argument(
+        "--version",
+        help="Specific version to set (e.g., 1.2.3)",
+    )
+    parser.add_argument(
+        "--bump",
+        choices=["major", "minor", "patch"],
+        help="Bump version",
+    )
+    parser.add_argument(
+        "--tag",
+        action="store_true",
+        help="Create git tag",
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="Push tag to origin",
+    )
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        help="Commit changes",
+    )
+    parser.add_argument(
+        "--current",
+        action="store_true",
+        help="Show current version",
+    )
     
     args = parser.parse_args()
     
     if args.current:
-        print(f"Current version: {get_current_version()}")
+        print(f"Current version: {get_current_version()}")  # noqa: T201
         return
     
     if not any([args.version, args.bump]):
         parser.error("Must specify either --version or --bump")
     
     current_version = get_current_version()
-    print(f"Current version: {current_version}")
+    print(f"Current version: {current_version}")  # noqa: T201
     
     if args.version:
         new_version = args.version
     else:
         new_version = bump_version(current_version, args.bump)
     
-    print(f"New version: {new_version}")
+    print(f"New version: {new_version}")  # noqa: T201
     
     # Update files
     update_version(new_version)
@@ -159,17 +197,19 @@ def main():
         commit_changes(new_version)
     
     if args.tag:
-        create_git_tag(new_version, args.push)
+        create_git_tag(new_version, push=args.push)
     
-    print("\nRelease preparation complete!")
-    print(f"Next steps:")
+    print("\nRelease preparation complete!")  # noqa: T201
+    print("Next steps:")  # noqa: T201
     if not args.commit:
-        print(f"  1. Review changes and commit: git add . && git commit -m 'Prepare release v{new_version}'")
+        print(  # noqa: T201
+            f"  1. Review changes and commit: git add . && git commit -m 'Prepare release v{new_version}'",
+        )
     if not args.tag:
-        print(f"  2. Create tag: git tag -a v{new_version} -m 'Release v{new_version}'")
+        print(f"  2. Create tag: git tag -a v{new_version} -m 'Release v{new_version}'")  # noqa: T201
     if not args.push:
-        print(f"  3. Push tag: git push origin v{new_version}")
-    print(f"  4. The GitHub Actions workflow will create the release automatically")
+        print(f"  3. Push tag: git push origin v{new_version}")  # noqa: T201
+    print("  4. The GitHub Actions workflow will create the release automatically")  # noqa: T201
 
 
 if __name__ == "__main__":
