@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+    
+    - name: Extract version from tag
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          TAG="${{ github.event.inputs.tag }}"
+        else
+          TAG="${GITHUB_REF#refs/tags/}"
+        fi
+        VERSION=${TAG#v}
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Tag: $TAG, Version: $VERSION"
+    
+    - name: Update version in pyproject.toml
+      run: |
+        sed -i 's/version = "[^"]*"/version = "${{ steps.version.outputs.version }}"/' pyproject.toml
+        echo "Updated version to ${{ steps.version.outputs.version }}"
+        grep 'version =' pyproject.toml
+    
+    - name: Generate changelog for this release
+      id: changelog
+      run: |
+        if [ ! -f CHANGELOG.md ]; then
+          echo "# Changelog" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)," >> CHANGELOG.md
+          echo "and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)." >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+        fi
+        
+        # Extract release notes for this version
+        if grep -q "## \[${{ steps.version.outputs.version }}\]" CHANGELOG.md; then
+          awk '/## \[${{ steps.version.outputs.version }}\]/{flag=1; next} /## \[/{flag=0} flag' CHANGELOG.md > release_notes.md
+        else
+          echo "Release ${{ steps.version.outputs.tag }}" > release_notes.md
+          echo "" >> release_notes.md
+          echo "This release includes the latest improvements and bug fixes." >> release_notes.md
+        fi
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        name: Release ${{ steps.version.outputs.tag }}
+        body_path: release_notes.md
+        draft: false
+        prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Clean up
+      run: rm -f release_notes.md
