@@ -1,20 +1,37 @@
 #include "all_to_all/intranode.cuh"
+
 #include "core/atomic.cuh"
+
 #include "core/device_utils.cuh"
 #include "core/utils.h"
 #include "intranode.h"
 
 #include <cassert>
 
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+
+#include <rocprofiler-sdk-roctx/roctx.h>
+
+#include "core/hip_defs.h"
+#include "core/hip_roctx_defs.h"
+
+#else
 #include <cooperative_groups.h>
 #include <nvtx3/nvToolsExt.h>
+#endif // USE_ROCM
 
 using namespace pplx;
+
+#if USE_ROCM
+// #define __ldg(...) __builtin_nontemporal_load(__VA_ARGS__)
+#endif 
 
 namespace {
 
 template <typename T, typename U, size_t NUM_WARPS, bool DO_SEND, bool DO_RECV>
-__global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void combineKernel(
     U *outTokens,
     size_t outTokensStrideElem,
     uint32_t *indices,
@@ -48,7 +65,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
   const unsigned numLocalExperts = numExperts / worldSize;
   const size_t tokenDim = hiddenDim * sizeof(T);
   const size_t tokenStride = round_up<size_t>(tokenDim, sizeof(int4));
-  constexpr unsigned WARP_SIZE = 32;
+  // constexpr unsigned WARP_SIZE = 32;
   uint32_t warpId = threadIdx.x / WARP_SIZE;
   const unsigned laneId = threadIdx.x % WARP_SIZE;
 
@@ -208,7 +225,7 @@ void AllToAllIntraNode::combine(
   assert(hiddenDimBytes % 16 == 0);
 
   dim3 dimGrid(numBlocks, 1, 1);
-  dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+  dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
 
   void *args[] = {
       const_cast<U **>(&outTokens.data),

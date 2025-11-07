@@ -1,6 +1,18 @@
 #pragma once
 
+#define USE_ROCM 1
+
+#ifdef USE_ROCM
+
+#include <rocshmem/rocshmem.hpp>
+
+#include "hip_dist_defs.h"
+
+__global__ void alltoallmem(int *source, int *dest, size_t nelem, rocshmem::rocshmem_team_t team);
+
+#else
 #include <nvshmem.h>
+#endif
 
 #include <vector>
 

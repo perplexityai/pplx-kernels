@@ -2,7 +2,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+
+#ifdef USE_ROCM
+
+#include "hip_defs.h"
+
+#else
 #include <cuda_runtime.h>
+#endif
 
 #define CUDACHECK(cmd)                                                                             \
   do {                                                                                             \

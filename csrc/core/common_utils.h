@@ -3,11 +3,26 @@
 #include <climits>
 #include <cstdint>
 
-#ifdef __CUDA_ARCH__
-#define PPLX_HOST_DEVICE __host__ __device__
+#if defined(__CUDA_ARCH__) || defined(__HIPCC__) || defined(__CUDACC__)
+#include <hip/hip_runtime.h>
+
+#define PPLX_HOST __host__
+#define PPLX_DEVICE __device__
+
+#define WARP_SIZE 64 // warpSize is restriced in device codes since SDK 7.0
+
 #else
-#define PPLX_HOST_DEVICE
+
+#include <cuda_runtime.h>
+
+#define PPLX_HOST
+#define PPLX_DEVICE
+
+#define WARP_SIZE 32
+
 #endif
+
+#define PPLX_HOST_DEVICE PPLX_HOST PPLX_DEVICE
 
 namespace pplx {
 
@@ -24,3 +39,36 @@ template <typename T> PPLX_HOST_DEVICE T ceil_div(T x, T y) { return (x + y - 1)
 template <typename T> PPLX_HOST_DEVICE T round_up(T x, T y) { return ceil_div<T>(x, y) * y; }
 
 } // namespace pplx
+
+#if defined(__HIP_PLATFORM_AMD__)
+
+#include <hip/hip_bf16.h>
+#include <hip/hip_common.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+
+namespace amdgpu {
+
+#define DEVICE_INLINE __device__ __inline__
+
+template <typename T>
+DEVICE_INLINE T shfl_xor_sync(unsigned mask, T var, int laneMask, int width = warpSize);
+
+template <>
+DEVICE_INLINE float shfl_xor_sync(unsigned mask, float var, int laneMask, int width) {
+  return __shfl_xor(var, laneMask, width);
+}
+
+template <>
+DEVICE_INLINE int shfl_xor_sync(unsigned mask, int var, int laneMask, int width) {
+  return __shfl_xor(var, laneMask, width);
+}
+
+} // namespace amdgpu
+
+template <typename T>
+DEVICE_INLINE T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width = 32/*use CUDA warp size as default*/) {
+  return amdgpu::shfl_xor_sync(mask, var, laneMask, width);
+}
+
+#endif // defined(__HIP_PLATFORM_AMD__)

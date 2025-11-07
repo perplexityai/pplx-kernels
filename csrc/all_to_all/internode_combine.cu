@@ -2,14 +2,39 @@
 #include "core/utils.h"
 #include "internode.h"
 
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+
+#include <rocprofiler-sdk-roctx/roctx.h>
+
+#include "core/hip_defs.h"
+#include "core/hip_cuda_dtype_defs.h"
+#include "core/hip_dist_defs.h"
+#include "core/hip_roctx_defs.h"
+
+#include <rocshmem/rocshmem.hpp>
+
+#else
+
 #include <cuda.h>
+
 #include <nvshmem.h>
 #include <nvtx3/nvToolsExt.h>
 
+#endif // USE_ROCM
+
+#include "core/common_utils.h"
+
 using namespace pplx;
 
+#if USE_ROCM
+using namespace rocshmem;
+#define __ldg(...) __builtin_nontemporal_load(__VA_ARGS__)
+#endif 
+
 template <typename T, typename U, size_t NUM_WARPS, bool DO_SEND, bool DO_RECV>
-__global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void combineKernel(
     U *outTokens,
     size_t outTokensStrideElem,
     const uint32_t *indices,
@@ -42,15 +67,29 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
 ) {
   const unsigned numLocalExperts = numExperts / worldSize;
   const size_t stride = hiddenDim * sizeof(T);
-  constexpr unsigned WARP_SIZE = 32;
+  
   uint32_t warpId = threadIdx.x / WARP_SIZE;
+  uint32_t laneId = threadIdx.x % WARP_SIZE;
+  
+  uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (DO_SEND) {
+    
     const size_t numSendTokens = __ldg(&globalTokenIndex);
+
+#if USE_ROCM
+    if (tid < worldSize) {
+      for (int i= tid; i < worldSize; i += gridDim.x * blockDim.x) {
+        rocshmem_ulonglong_p((unsigned long long *)&combineSyncBuffer[rank], 1U, i);
+      }
+    }
+    rocshmem_fence(); 
+#else
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {
       nvshmemx_signal_op(&combineSyncBuffer[rank], 1, NVSHMEM_SIGNAL_SET, i);
     }
+#endif // USE_ROCM
 
     // Dispatch the tokens from the expert to the DP groups.
     for (uint32_t token = blockIdx.x; token < numSendTokens; token += gridDim.x) {
@@ -70,7 +109,12 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
         const unsigned n = stride / sizeof(int4);
 #pragma unroll(4)
         for (unsigned j = threadIdx.x; j < n; j += blockDim.x) {
+#if USE_ROCM
+          // 
+          *dstPtr = *srcPtr;
+#else
           *dstPtr = __ldg(srcPtr);
+#endif // USE_ROCM
           dstPtr += blockDim.x;
           srcPtr += blockDim.x;
         }
@@ -85,24 +129,42 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
         const int dstRank = dp * dpSize + i;
         const unsigned index = dstExpert * maxNumTokens + source;
         std::byte *dstPtr = xBufferOut + index * stride;
+#if USE_ROCM
+        rocshmem::rocshmem_putmem_signal_nbi_wave(
+            dstPtr, xTokenPtr, stride,  &combineSignalBuffer[source], 1, rocshmem::ROCSHMEM_SIGNAL_ADD, dstRank
+        );
+#else
         nvshmemx_putmem_signal_nbi_warp(
             dstPtr, xTokenPtr, stride, &combineSignalBuffer[source], 1, NVSHMEM_SIGNAL_ADD, dstRank
         );
+#endif // USE_ROCM
       }
     }
   }
 
-  // Synchronize the grid to ensure that tokens routed within the rank are
-  // correctly transported from one block to another.
   if (DO_RECV) {
     if (DO_SEND) {
+      // Synchronize the grid to ensure that tokens routed within the rank are
+      // correctly transported from one block to another.     
       cooperative_groups::this_grid().sync();
+#if USE_ROCM
+      // NOTE (yiakwy) : for AMD GPU we explicitly make sure IO fence inserted
+      rocshmem::rocshmem_fence(); 
+      rocshmem::rocshmem_barrier_all_wg(); 
+#endif // USE_ROCM
     }
 
     // Compute the weighed sum of the input tokens.
     const size_t localNumTokens = boundM ? __ldg(boundM) : m;
     for (unsigned i = blockIdx.x; i < localNumTokens; i += gridDim.x) {
+
+#if USE_ROCM
+      // TODO (yiakwy) : add uint64 interface
+      rocshmem::rocshmem_ulonglong_wait_until((unsigned long long *)&combineSignalBuffer[i], rocshmem::ROCSHMEM_CMP_EQ, expertsPerToken);
+#else
       nvshmem_uint64_wait_until(&combineSignalBuffer[i], NVSHMEM_CMP_EQ, expertsPerToken);
+#endif
+
       __syncthreads();
       combineSignalBuffer[i] = 0;
 
@@ -136,7 +198,13 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
 
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {
+
+#if USE_ROCM
+      rocshmem::rocshmem_ulonglong_wait_until((unsigned long long *)&combineSignalBuffer[i], rocshmem::ROCSHMEM_CMP_EQ, 1U);
+#else
       nvshmem_uint64_wait_until(&combineSyncBuffer[i], NVSHMEM_CMP_EQ, 1);
+#endif // USE_ROCM
+
       combineSyncBuffer[i] = 0;
     }
 
@@ -167,7 +235,7 @@ void AllToAllInterNode::combine(
   assert(hiddenDimBytes % 16 == 0);
 
   dim3 dimGrid(numBlocks, 1, 1);
-  dim3 dimBlock(NUM_WARPS * 32, 1, 1);
+  dim3 dimBlock(NUM_WARPS * WARP_SIZE, 1, 1);
 
   void *args[] = {
       const_cast<U **>(&outTokens.data),

@@ -1,6 +1,11 @@
 #pragma once
 
+#ifdef USE_ROCM
+#include "core/hip_defs.h"
+#include "core/hip_cuda_dtype_defs.h"
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include "core/cuda_utils.h"
 
@@ -14,7 +19,7 @@ template <typename T> class HostBuffer final {
 public:
   HostBuffer(size_t size)
       : size_(size) {
-    CUDACHECK(cudaMallocHost(&data_, size * sizeof(T)));
+    CUDACHECK(cudaMallocHost(  (void **) &data_, size * sizeof(T)));
   }
 
   HostBuffer(const DeviceBuffer<T> &device_buffer);
@@ -90,7 +95,7 @@ private:
 template <typename T>
 HostBuffer<T>::HostBuffer(const DeviceBuffer<T> &device_buffer)
     : size_(device_buffer.size()) {
-  CUDACHECK(cudaMallocHost(&data_, size_ * sizeof(T)));
+  CUDACHECK(cudaMallocHost( (void**) &data_, size_ * sizeof(T)));
   CUDACHECK(cudaMemcpy(data_, device_buffer.get(), size_ * sizeof(T), cudaMemcpyDeviceToHost));
 }
 
