@@ -23,6 +23,42 @@ find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(Torch REQUIRED)
 find_package(NVSHMEM REQUIRED)
 
+# === NIXL Configuration ===
+set(PPLX_ENABLE_P2P $ENV{PPLX_ENABLE_P2P})
+
+# Multi-channel worker configuration from environment (default 8)
+set(PPLX_NIXL_NUM_CHANNELS $ENV{PPLX_NIXL_NUM_CHANNELS})
+if(NOT PPLX_NIXL_NUM_CHANNELS OR PPLX_NIXL_NUM_CHANNELS EQUAL 0)
+    set(PPLX_NIXL_NUM_CHANNELS 8)
+endif()
+message(STATUS "PPLX_NIXL_NUM_CHANNELS=${PPLX_NIXL_NUM_CHANNELS}")
+
+add_library(nixl_interface INTERFACE)
+
+target_link_libraries(nixl_interface INTERFACE
+    serdes
+    stream
+    ucx_utils
+    nixl_common
+    nixl_build
+    nixl
+)
+
+# Enable P2P/NVLINK support if requested
+if(PPLX_ENABLE_P2P)
+    target_compile_definitions(nixl_interface INTERFACE
+        PPLX_ENABLE_P2P
+        PPLX_ATOMIC_SCOPE=__NV_THREAD_SCOPE_SYSTEM)
+    message(STATUS "P2P/NVLINK support: ENABLED (using system-scope atomics)")
+else()
+    target_compile_definitions(nixl_interface INTERFACE
+        PPLX_ATOMIC_SCOPE=__NV_THREAD_SCOPE_DEVICE)
+    message(STATUS "P2P/NVLINK support: DISABLED (using device-scope atomics)")
+endif()
+
+# Multi-channel NIXL configuration (compile-time constant from env)
+target_compile_definitions(nixl_interface INTERFACE PPLX_NIXL_NUM_CHANNELS=${PPLX_NIXL_NUM_CHANNELS})
+
 if(WITH_TESTS)
     enable_testing()
     find_package(MPI REQUIRED)
@@ -46,8 +82,18 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # CUDA-specific compile options function
 function(set_cuda_compile_options target)
+    # Base CUDA compile options
+    set(CUDA_COMPILE_FLAGS "--threads=32" "-O3")
+
+    # Workaround for CUDA 12.9 compilation bug
+    # See: https://github.com/openucx/ucx/pull/10960
+    if(CUDAToolkit_VERSION_MAJOR EQUAL 12 AND CUDAToolkit_VERSION_MINOR EQUAL 9)
+        message(STATUS "Detected CUDA 12.9: applying _LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE workaround")
+        list(APPEND CUDA_COMPILE_FLAGS "-D_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE")
+    endif()
+
     target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--threads=32 -O3>)
+        $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_COMPILE_FLAGS}>)
 endfunction()
 
 # === Library targets ===
@@ -70,6 +116,9 @@ target_link_libraries(pplx_kernels PUBLIC
     nvshmem::nvshmem_host
     nvshmem::nvshmem_device
 )
+
+# Always link NIXL (headers/libraries always available)
+target_link_libraries(pplx_kernels PUBLIC nixl_interface)
 set_target_properties(pplx_kernels PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../src/pplx_kernels
     CUDA_SEPARABLE_COMPILATION ON

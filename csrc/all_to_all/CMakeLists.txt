@@ -6,6 +6,7 @@ add_library(all_to_all_common STATIC
 
 target_link_libraries(all_to_all_common PUBLIC
     CUDA::cudart
+    nixl_interface
 )
 
 add_library(all_to_all_intranode_lib STATIC
@@ -21,6 +22,9 @@ target_link_libraries(all_to_all_intranode_lib INTERFACE
     nvshmem::nvshmem_host
 )
 target_include_directories(all_to_all_intranode_lib PRIVATE ${NVSHMEM_INCLUDE_DIR})
+
+target_link_libraries(all_to_all_intranode_lib PUBLIC nixl_interface)
+
 set_cuda_compile_options(all_to_all_intranode_lib)
 
 add_library(all_to_all_internode_lib STATIC
@@ -32,10 +36,9 @@ target_link_libraries(all_to_all_internode_lib PUBLIC
     all_to_all_common
     CUDA::cudart
 )
-target_link_libraries(all_to_all_internode_lib INTERFACE
-    nvshmem::nvshmem_host
-)
-target_include_directories(all_to_all_internode_lib PRIVATE ${NVSHMEM_INCLUDE_DIR})
+
+target_link_libraries(all_to_all_internode_lib PUBLIC nixl_interface)
+
 set_cuda_compile_options(all_to_all_internode_lib)
 
 if(WITH_TESTS)
@@ -52,6 +55,8 @@ if(WITH_TESTS)
         MPI::MPI_CXX
         nvshmem::nvshmem_host
     )
+
+    target_link_libraries(test_all_to_all PUBLIC nixl_interface)
     set_cuda_compile_options(test_all_to_all)
     add_test(NAME AllToAllTest
              COMMAND ${MPIEXEC_EXECUTABLE} -np 4 $<TARGET_FILE:test_all_to_all>)
@@ -71,4 +76,6 @@ if (WITH_BENCHMARKS)
         MPI::MPI_CXX
         nvshmem::nvshmem_host
     )
+
+    target_link_libraries(bench_all_to_all PUBLIC nixl_interface)
 endif()
