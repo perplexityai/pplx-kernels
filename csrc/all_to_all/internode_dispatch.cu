@@ -1,11 +1,11 @@
 #include <cooperative_groups.h>
 #include <cuda.h>
-#include <nvshmem.h>
 #include <nvtx3/nvToolsExt.h>
 
 #include "all_to_all/internode.h"
 #include "core/device_utils.cuh"
 #include "core/utils.h"
+#include "core/nixl_utils.cuh"
 
 using namespace pplx;
 
@@ -47,10 +47,18 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
     uint32_t *sourceGroup,
     uint32_t *sourceToken,
     uint64_t *numTokensBuffer,
+    uint64_t *numTokensLocalBuffer,
     uint64_t *numRecvBuffer,
+    uint64_t *numRecvLocalBuffer,
     uint32_t &globalTokenIndex,
     std::byte *xBufferIn,
-    std::byte *xBufferOut
+    std::byte *xBufferOut,
+    const MemLayout memLayout,
+    std::byte **peerDataBases,
+    std::byte **peerCounterBases,
+    size_t numChannels,
+    const nixlGpuXferReqH* dataReqs,
+    const nixlGpuXferReqH* signalReqs
 ) {
   // Determine the rank, DP rank and per-rank constants.
   const unsigned numLocalExperts = numExperts / worldSize;
@@ -62,6 +70,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
   const unsigned WARP_SIZE = 32;
   const unsigned warpId = threadIdx.x / WARP_SIZE;
   const unsigned laneId = threadIdx.x % WARP_SIZE;
+  const size_t channelId = select_channel(numChannels);
 
   // Determine the number of tokens populated which are to be sent.
   const unsigned numSendTokens = boundM ? __ldg(boundM) : m;
@@ -98,10 +107,30 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
         }
 
         unsigned numTokensPerExpert = device::warp_sum(count);
-        uint64_t *dstCount = &numTokensBuffer[dstLocalExpert * numDPGroups + dpGroup];
 
         if (laneId == 0) {
-          nvshmemx_signal_op(dstCount, numTokensPerExpert + 1, NVSHMEM_SIGNAL_SET, dstRank);
+          const uint32_t targetGroup = dstLocalExpert * numDPGroups + dpGroup;
+          const uint64_t tokenValue = numTokensPerExpert + 1;
+          const size_t tokenCounterOffset = memLayout.counterTokenOffset + counter_byte_offset(targetGroup);
+
+          if (peerCounterBases[dstRank] != nullptr) {
+            uint64_t value = tokenValue;
+            __nv_atomic_store(
+                (uint64_t*)(peerCounterBases[dstRank] + tokenCounterOffset),
+                &value,
+                __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+          } else {
+            size_t reqIdx = channel_request_index(channelId, dstRank, worldSize);
+            nixl_status_t st = nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(
+                signalReqs[reqIdx],
+                /*signal_desc_index=*/0,
+                /*signal_inc=*/(uint64_t)tokenValue,
+                /*signal_offset=*/tokenCounterOffset,
+                /*channel_id=*/0,
+                /*is_no_delay=*/true,
+                /*status=*/nullptr);
+            PPLX_DEVICE_ASSERT_POST_STATUS(st);
+          }
         }
       }
 
@@ -153,16 +182,50 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
             const uint32_t group = dstLocalExpert * numDPGroups + dpGroup;
             const unsigned loc = group * maxNumTokens + index;
 
-            std::byte *destPointer = xBufferOut + loc * tokenStride;
-            nvshmemx_putmem_signal_nbi_warp(
-                destPointer,
-                xInPtr,
-                tokenStride,
-                &numRecvBuffer[group],
-                1,
-                NVSHMEM_SIGNAL_ADD,
-                dstRank
-            );
+            // Unified offset calculation for both P2P and NIXL paths
+            const size_t dstTokenOffset = loc * tokenStride;
+            const size_t srcTokenOffset = i * tokenStride;
+            const size_t dstDataOffset = memLayout.dispatchOutOffset + dstTokenOffset;
+            const size_t srcDataOffset = memLayout.dispatchInOffset + srcTokenOffset;
+
+            const size_t recvCounterOffset = memLayout.counterRecvOffset + counter_byte_offset(group);
+
+            if (peerCounterBases[dstRank] != nullptr) {
+              device::warp_streaming_copy_and_sync(
+                  peerDataBases[dstRank] + dstDataOffset,
+                  xInPtr, tokenStride, laneId);
+              if (laneId == 0) {
+                __nv_atomic_add(
+                    (uint64_t*)(peerCounterBases[dstRank] + recvCounterOffset),
+                    1ull,
+                    __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+              }
+            } else {
+              size_t reqIdx = channel_request_index(channelId, dstRank, worldSize);
+              if (laneId == 0) {
+                size_t size = tokenStride;
+                nixl_status_t rd = nixlGpuPostSingleWriteXferReq<nixl_gpu_level_t::THREAD>(
+                    dataReqs[reqIdx],
+                    /*desc_index=*/0,
+                    /*local_offset=*/srcDataOffset,
+                    /*remote_offset=*/dstDataOffset,
+                    /*size=*/size,
+                    /*channel_id=*/0,
+                    /*is_no_delay=*/false,
+                    /*status=*/nullptr);
+                PPLX_DEVICE_ASSERT_POST_STATUS(rd);
+                nixl_status_t rs = nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(
+                    signalReqs[reqIdx],
+                    /*signal_desc_index=*/0,
+                    /*signal_inc=*/1,
+                    /*signal_offset=*/recvCounterOffset,
+                    /*channel_id=*/0,
+                    /*is_no_delay=*/true,
+                    /*status=*/nullptr);
+                PPLX_DEVICE_ASSERT_POST_STATUS(rs);
+              }
+            }
+            __syncwarp();
           }
         }
       }
@@ -188,13 +251,27 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void dispatchKernel(
 
       // Fetch the token count per DP, which is non-zero to indicate receipt.
       // Afterwards, wait for exactly that many tokens to be sent to us.
-      nvshmem_uint64_wait_until(&numTokensBuffer[group], NVSHMEM_CMP_NE, 0);
-      size_t numTokens = numTokensBuffer[group] - 1;
-      nvshmem_uint64_wait_until(&numRecvBuffer[group], NVSHMEM_CMP_EQ, numTokens);
+      const uint32_t dp = group % numDPGroups;
+      const uint32_t counterIdx = expert * numDPGroups + dp;
+      uint64_t *tokenRemote = numTokensBuffer + counterIdx;
+      uint64_t *tokenLocal  = numTokensLocalBuffer + counterIdx;
+      uint64_t tokenSum = device::nixl_wait_until_sum_ne_zero(tokenRemote, tokenLocal);
+      size_t numTokens = tokenSum - 1;
+
+      uint64_t *recvRemote = numRecvBuffer + counterIdx;
+      uint64_t *recvLocal  = numRecvLocalBuffer + counterIdx;
+      device::nixl_wait_until_sum_eq(
+          recvRemote,
+          recvLocal,
+          numTokens
+      );
 
       numTokensPerDP[group] = numTokens;
-      numTokensBuffer[group] = 0;
-      numRecvBuffer[group] = 0;
+      uint64_t zero = 0ull;
+      pplx::st_flag_release(tokenRemote, 0ull);
+      __nv_atomic_store(tokenLocal, &zero, __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+      pplx::st_flag_release(recvRemote, 0ull);
+      __nv_atomic_store(recvLocal,  &zero, __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
       sharedExpert[group - firstGroup] = atomicAdd(&outNumTokensPerExpert[expert], numTokens);
       sharedToken[group - firstGroup] = atomicAdd(&globalTokenIndex, numTokens);
     }
@@ -277,6 +354,15 @@ void AllToAllInterNode::dispatch(
   const size_t sharedMemorySend = sizeof(uint32_t) * numExperts;
   const size_t sharedMemoryRecv = sizeof(uint32_t) * expertsPerBlock * 2;
 
+  PPLX_ASSERT(nixlTokenRemoteCounters != nullptr, "NIXL token remote counters not initialized");
+  PPLX_ASSERT(nixlRecvRemoteCounters != nullptr, "NIXL recv remote counters not initialized");
+  PPLX_ASSERT(nixlTokenLocalCounters != nullptr, "NIXL token local counters not initialized");
+  PPLX_ASSERT(nixlRecvLocalCounters != nullptr, "NIXL recv local counters not initialized");
+  uint64_t *numTokensBufferArg = nixlTokenRemoteCounters;
+  uint64_t *numRecvBufferArg = nixlRecvRemoteCounters;
+  uint64_t *numTokensLocalBufferArg = nixlTokenLocalCounters;
+  uint64_t *numRecvLocalBufferArg = nixlRecvLocalCounters;
+
   void *args[] = {
       const_cast<int32_t **>(&outNumTokensPerExpert.data),
       const_cast<size_t *>(&outNumTokensPerExpert.strideElem),
@@ -311,11 +397,19 @@ void AllToAllInterNode::dispatch(
       &sourceOffset,
       &sourceGroup,
       &sourceToken,
-      &numTokensBuffer,
-      &numDispatchRecvBuffer,
+      &numTokensBufferArg,
+      &numTokensLocalBufferArg,
+      &numRecvBufferArg,
+      &numRecvLocalBufferArg,
       &tokenIndex,
       &xDispatchIn,
       &xDispatchOut,
+      &memLayout,
+      &peerDataBases,
+      &peerCounterBases,
+      const_cast<size_t*>(&numChannels),
+      &dChannelDataReqsFlat,
+      &dChannelSignalReqsFlat,
   };
 
   nvtxRangePush("dispatch");

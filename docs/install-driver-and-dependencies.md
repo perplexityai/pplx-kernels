@@ -6,6 +6,11 @@ Here's a summary of the software and drivers required for running pplx-kernels o
 |---------------------------|-------------|--------------------------|---------------------|
 | NVIDIA Driver             | Y           | Y                        | Y                   |
 | modprobe.d/nvidia.conf    |             | Y                        |                     |
+| CUDA Toolkit              | Y           | Y                        | Y                   |
+| RDMA-Core                 |             | Y                        | Y                   |
+| UCX Library               |             | Y                        | Y                   |
+| NIXL Library              |             | Y                        | Y                   |
+| DOCA (GPUNetIO)           |             | Y                        |                     |
 | GDRCopy Driver            |             | Y                        | Y                   |
 | GDRCopy Library           |             | Y                        | Y                   |
 | NVSHMEM Library           | Y           | Y                        | Y                   |
@@ -18,6 +23,10 @@ Here's a summary of the software and drivers required for running pplx-kernels o
 
 ## NVIDIA Driver Config
 
+### NIXL + UCX + DOCA Configuration
+
+For ConnectX systems, internode communication can use NIXL + UCX with DOCA GPUNetIO. The following sections detail the installation and configuration.
+
 To use IBGDA, NVIDIA Driver needs to be configured to allow GPU to initiate communication.
 
 ```bash
@@ -25,6 +34,127 @@ echo 'options nvidia NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappin
 sudo update-initramfs -u
 sudo reboot
 ```
+
+#### System Packages for NIXL/UCX/DOCA
+
+Install common build dependencies (Ubuntu 24.04 example):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake gcc g++ ninja-build pkg-config \
+  autoconf automake libtool git valgrind \
+  linux-headers-$(uname -r) \
+  meson python3-pip python3-dev python3-docutils \
+  libnl-3-dev libnl-route-3-dev \
+  libglib2.0-dev libssl-dev libzip-dev libjson-c-dev \
+  libpcap-dev libjsoncpp-dev curl
+```
+
+#### RDMA-Core
+
+```bash
+git clone https://github.com/linux-rdma/rdma-core.git
+cd rdma-core
+git checkout v58.0
+mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/opt/rdma
+make -j"$(nproc)"
+sudo make install
+```
+
+Set `RDMA_HOME=/opt/rdma`.
+
+#### DOCA
+
+Install DOCA with GPUNetIO and set `DOCA_HOME` to its install prefix. Refer to NVIDIA DOCA SDK documentation for obtaining packages and prerequisites.
+
+Example install layout expectation:
+- Headers at `$DOCA_HOME/include`
+- Libraries at `$DOCA_HOME/lib/x86_64-linux-gnu`
+
+#### UCX
+
+Build UCX with CUDA, GDRCopy, and DOCA support.
+
+```bash
+git clone https://github.com/openucx/ucx.git
+cd ucx
+./autogen.sh
+./contrib/configure-release-mt --prefix=/opt/ucx \
+  --with-verbs=/opt/rdma \
+  --with-cuda=/usr/local/cuda \
+  --with-gdrcopy=/opt/gdrcopy \
+  --with-doca=${DOCA_HOME:-no}
+make -j"$(nproc)"
+sudo make install
+```
+
+Set `UCX_HOME=/opt/ucx`.
+
+#### NIXL
+
+Follow the build instructions in the NIXL repository: [NIXL repository](https://github.com/ai-dynamo/nixl). Example:
+
+```bash
+pip3 install --upgrade meson pybind11
+git clone https://github.com/ai-dynamo/nixl.git
+cd nixl
+meson setup build -Ducx_path=/opt/ucx -Dprefix=/opt/nixl --buildtype=release
+sudo ninja install -C build
+```
+
+Set `NIXL_HOME=/opt/nixl`.
+
+#### Runtime Environment
+
+Set up environment variables (adjust paths to your installation):
+
+```bash
+export CUDA_HOME=/usr/local/cuda
+export RDMA_HOME=/opt/rdma
+export DOCA_HOME=/opt/doca
+export UCX_HOME=/opt/ucx
+export NIXL_HOME=/opt/nixl
+
+export LD_LIBRARY_PATH="$UCX_HOME/lib:$NIXL_HOME/lib:$CUDA_HOME/lib64:${DOCA_HOME:+$DOCA_HOME/lib/x86_64-linux-gnu:}$LD_LIBRARY_PATH"
+export LD_PRELOAD="${DOCA_HOME:+$DOCA_HOME/lib/x86_64-linux-gnu/libdoca_common.so:$DOCA_HOME/lib/x86_64-linux-gnu/libdoca_gpunetio.so:$DOCA_HOME/lib/x86_64-linux-gnu/libdoca_verbs.so}"
+```
+
+#### UCX Network Device Selection
+
+On some systems UCX may not automatically pick the desired NIC per GPU. Explicitly set `UCX_NET_DEVICES` to map each GPU to the correct NIC and port.
+
+Shell example (single-node, 1:1 GPU-to-NIC mapping):
+
+```bash
+# Adjust NIC names (mlx5_X) and port (:1) as needed
+export UCX_NET_DEVICES="cuda${LOCAL_RANK}-mlx5_${LOCAL_RANK}:1"
+```
+
+Python example (custom mapping list):
+
+```python
+import os
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+pxb_nics = ["mlx5_0", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_9", "mlx5_10", "mlx5_11"]
+os.environ['UCX_NET_DEVICES'] = f'cuda{local_rank}-{pxb_nics[local_rank]}:1'
+```
+
+Project example (as used in `tests/bench_all_to_all.py`):
+
+```python
+import os
+# Map each GPU to a specific mlx5 device and include additional NICs
+pxb_nics_eos = ["mlx5_0", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_9", "mlx5_10", "mlx5_11"]
+tcp_nics_eos = ',ibp154s0,ibp192s0,ibp206s0,ibp220s0,ibp94s0'
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+os.environ['UCX_NET_DEVICES'] = f'cuda{local_rank}-{pxb_nics_eos[local_rank]}:1' + tcp_nics_eos
+```
+
+Adjust device names to match your system (`mlx5_*`, `ibp*`, and the `:1` port).
+
+This configuration aligns pplx-kernels internode usage with NIXL + UCX. Adjust paths and options to match your deployment.
 
 ## GDRCopy
 

@@ -20,8 +20,18 @@ __forceinline__ __device__ uint32_t ld_flag_acquire(uint32_t *flag_addr) {
   return flag;
 }
 
+__forceinline__ __device__ uint64_t ld_flag_acquire(uint64_t *flag_addr) {
+  uint64_t flag;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(flag) : "l"(flag_addr));
+  return flag;
+}
+
 __forceinline__ __device__ void st_flag_release(uint32_t *flag_addr, uint32_t flag) {
   asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+}
+
+__forceinline__ __device__ void st_flag_release(uint64_t *flag_addr, uint64_t flag) {
+  asm volatile("st.release.sys.global.u64 [%1], %0;" ::"l"(flag), "l"(flag_addr) : "memory");
 }
 
 __forceinline__ __device__ uint32_t add_flag_release(uint32_t *addr, uint32_t val) {

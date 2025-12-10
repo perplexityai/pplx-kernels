@@ -11,4 +11,7 @@ target_link_libraries(core_lib INTERFACE
     nvshmem::nvshmem_host
 )
 target_include_directories(core_lib PRIVATE ${NVSHMEM_INCLUDE_DIR})
+
+target_link_libraries(core_lib PUBLIC nixl_interface)
+
 set_cuda_compile_options(core_lib)

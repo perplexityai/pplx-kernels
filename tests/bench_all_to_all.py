@@ -33,6 +33,9 @@ def bench_all_to_all(
     device = pgi.device
     num_dp = pgi.world_size // dp_size
     dp_rank = pgi.rank // dp_size
+    pxb_nics_eos = ["mlx5_0", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_9", "mlx5_10", "mlx5_11"]
+    tcp_nics_eos = ',ibp154s0,ibp192s0,ibp206s0,ibp220s0,ibp94s0'
+    os.environ['UCX_NET_DEVICES'] = f'cuda{pgi.local_rank}-{pxb_nics_eos[pgi.local_rank]}:1' + tcp_nics_eos
 
     # Generate the same rank data for each DP group
     rng = torch.Generator()

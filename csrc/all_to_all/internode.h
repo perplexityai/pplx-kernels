@@ -2,10 +2,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <sys/stat.h>
 
 #include "all_to_all/all_to_all.h"
 #include "core/buffer.h"
+
+#include "core/nixl_utils.cuh"
+#include <nixl.h>
 
 namespace pplx {
 
@@ -122,14 +129,88 @@ private:
 
   /// @section Pre-allocated symmetric shared memory workspace.
   uint32_t *numTokensPerDP = nullptr;
-  uint64_t *numTokensBuffer = nullptr;
-  uint64_t *numDispatchRecvBuffer = nullptr;
   uint64_t *combineSignalBuffer = nullptr;
   uint64_t *combineSyncBuffer = nullptr;
+  uint64_t *combineLocalSignalBuffer = nullptr;
+  uint64_t *combineLocalSyncBuffer = nullptr;
   std::byte *xDispatchIn = nullptr;
   std::byte *xDispatchOut = nullptr;
   std::byte *xCombineIn = nullptr;
   std::byte *xCombineOut = nullptr;
+
+  struct alignas(16) PeerInfo {
+    int deviceId;
+    int rank;
+
+    void* dataBase;              ///< Base of DATA super-region (dispatch/combine buffers)
+    size_t dataSize;             ///< Size of DATA super-region
+    void* countersRemoteBase;    ///< Base of REMOTE counter block (RDMA targets)
+    size_t countersRemoteSize;   ///< Size of REMOTE counter block
+    void* countersLocalBase;     ///< Base of LOCAL counter block (self/P2P fast-path data)
+    size_t countersLocalSize;    ///< Size of LOCAL counter block
+
+    #ifdef PPLX_ENABLE_P2P
+    cudaIpcMemHandle_t dataSuperHandle;
+    cudaIpcMemHandle_t countersLocalHandle;
+    char bootId[40];
+    ino_t ipcNamespaceInode;
+    #endif
+  };
+
+  /// @section NIXL-specific members
+  const size_t numChannels;
+  std::vector<PeerInfo> peerInfos;
+
+  std::unique_ptr<nixlAgent> agent;
+  nixlBackendH* backend = nullptr;
+
+  std::vector<nixlGpuXferReqH> gpuDataReqs;
+  std::vector<nixlGpuXferReqH> gpuSignalReqs;
+  std::vector<nixlXferReqH*> cpuXferReqs;
+
+  nixlGpuXferReqH* dChannelDataReqsFlat = nullptr;
+  nixlGpuXferReqH* dChannelSignalReqsFlat = nullptr;
+
+  nixl_reg_dlist_t originalDataDlist;
+  nixl_reg_dlist_t originalCountersDlist;
+
+  uint64_t* nixlTokenRemoteCounters = nullptr;
+  uint64_t* nixlTokenLocalCounters = nullptr;
+  uint64_t* nixlRecvRemoteCounters = nullptr;
+  uint64_t* nixlRecvLocalCounters = nullptr;
+
+  std::byte** peerDataBases = nullptr;
+  std::byte** peerCounterBases = nullptr;
+
+  MemLayout memLayout;
+  std::byte* dataSuperBase = nullptr;
+  std::byte* countersRemoteBase = nullptr;
+  std::byte* countersLocalBase = nullptr;
+
+  std::vector<void*> hPeerDataSuperBases;
+  std::vector<void*> hPeerCountersLocalBases;
+
+  void initializeNixlAgent();
+  void destroyNixlAgent();
+
+  void wireupNixl();
+  void unwireNixl();
+
+  void createAllNixlRequests();
+  void destroyAllNixlRequests();
+
+  void setupPeerArrays();
+  void destroyPeerArrays();
+
+  void initializeMemoryLayout(
+      size_t dispatchInSize,
+      size_t dispatchOutSize,
+      size_t combineInSize,
+      size_t combineOutSize,
+      size_t counterSpan,
+      size_t maxNumTokens,
+      size_t worldSize);
+
 };
 
 } // namespace pplx

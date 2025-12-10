@@ -1,9 +1,9 @@
-#include "core/nvshmem_utils.h"
+#include "core/device_utils.cuh"
 #include "core/utils.h"
+#include "core/nixl_utils.cuh"
 #include "internode.h"
 
 #include <cuda.h>
-#include <nvshmem.h>
 #include <nvtx3/nvToolsExt.h>
 
 using namespace pplx;
@@ -35,21 +35,51 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
     const uint32_t *sourceOffset,
     const uint32_t *sourceGroup,
     uint64_t *combineSignalBuffer,
+    uint64_t *combineSignalLocalBuffer,
     uint64_t *combineSyncBuffer,
+    uint64_t *combineSyncLocalBuffer,
     uint32_t &globalTokenIndex,
     std::byte *xBufferIn,
-    std::byte *xBufferOut
+    std::byte *xBufferOut,
+    const MemLayout memLayout,
+    std::byte **peerDataBases,
+    std::byte **peerCounterBases,
+    size_t numChannels,
+    const nixlGpuXferReqH* dataReqs,
+    const nixlGpuXferReqH* signalReqs
 ) {
+
   const unsigned numLocalExperts = numExperts / worldSize;
   const size_t stride = hiddenDim * sizeof(T);
   constexpr unsigned WARP_SIZE = 32;
   uint32_t warpId = threadIdx.x / WARP_SIZE;
 
+  const size_t channelId = select_channel(numChannels);
+
   if (DO_SEND) {
     const size_t numSendTokens = __ldg(&globalTokenIndex);
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {
-      nvshmemx_signal_op(&combineSyncBuffer[rank], 1, NVSHMEM_SIGNAL_SET, i);
+        const size_t syncCounterOffset = memLayout.counterSyncOffset + counter_byte_offset(rank);
+
+        if (peerCounterBases[i] != nullptr) {
+          uint64_t one = 1ull;
+          __nv_atomic_store(
+              (uint64_t*)(peerCounterBases[i] + syncCounterOffset),
+              &one,
+              __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+        } else {
+          size_t reqIdx = channel_request_index(channelId, i, worldSize);
+          nixl_status_t status = nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(
+              signalReqs[reqIdx],
+              /*signal_desc_index=*/0,
+              /*signal_inc=*/1,
+              /*signal_offset=*/syncCounterOffset,
+              /*channel_id=*/0,
+              /*is_no_delay=*/true,
+              /*status=*/nullptr);
+          PPLX_DEVICE_ASSERT_POST_STATUS(status);
+        }
     }
 
     // Dispatch the tokens from the expert to the DP groups.
@@ -84,10 +114,52 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
       for (unsigned i = warpId; i < dpSize; i += NUM_WARPS) {
         const int dstRank = dp * dpSize + i;
         const unsigned index = dstExpert * maxNumTokens + source;
-        std::byte *dstPtr = xBufferOut + index * stride;
-        nvshmemx_putmem_signal_nbi_warp(
-            dstPtr, xTokenPtr, stride, &combineSignalBuffer[source], 1, NVSHMEM_SIGNAL_ADD, dstRank
-        );
+
+        // Unified offset calculation for both P2P and NIXL paths
+        const size_t dstTokenOffset = index * stride;
+        const size_t srcTokenOffset = token * stride;
+        const size_t dstDataOffset = memLayout.combineOutOffset + dstTokenOffset;
+        const size_t srcDataOffset = memLayout.combineInOffset + srcTokenOffset;
+
+        const size_t signalCounterOffset = memLayout.counterSignalOffset + counter_byte_offset(source);
+
+        if (peerCounterBases[dstRank] != nullptr) {
+          device::warp_streaming_copy_and_sync(
+              peerDataBases[dstRank] + dstDataOffset,
+              xTokenPtr, stride, threadIdx.x % WARP_SIZE);
+          if (threadIdx.x % WARP_SIZE == 0) {
+            __nv_atomic_add(
+                (uint64_t*)(peerCounterBases[dstRank] + signalCounterOffset),
+                1ull,
+                __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+          }
+        } else {
+          if (threadIdx.x % WARP_SIZE == 0) {
+            size_t sizeBytes = stride;
+            size_t reqIdx = channel_request_index(channelId, dstRank, worldSize);
+            nixl_status_t stData = nixlGpuPostSingleWriteXferReq<nixl_gpu_level_t::THREAD>(
+                dataReqs[reqIdx],
+                /*desc_index=*/0,
+                /*local_offset=*/srcDataOffset,
+                /*remote_offset=*/dstDataOffset,
+                /*size=*/sizeBytes,
+                /*channel_id=*/0,
+                /*is_no_delay=*/false,
+                /*status=*/nullptr);
+            PPLX_DEVICE_ASSERT_POST_STATUS(stData);
+
+            nixl_status_t stSignal = nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(
+                signalReqs[reqIdx],
+                /*signal_desc_index=*/0,
+                /*signal_inc=*/1,
+                /*signal_offset=*/signalCounterOffset,
+                /*channel_id=*/0,
+                /*is_no_delay=*/true,
+                /*status=*/nullptr);
+            PPLX_DEVICE_ASSERT_POST_STATUS(stSignal);
+          }
+        }
+        __syncwarp();
       }
     }
   }
@@ -102,9 +174,27 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
     // Compute the weighed sum of the input tokens.
     const size_t localNumTokens = boundM ? __ldg(boundM) : m;
     for (unsigned i = blockIdx.x; i < localNumTokens; i += gridDim.x) {
-      nvshmem_uint64_wait_until(&combineSignalBuffer[i], NVSHMEM_CMP_EQ, expertsPerToken);
+      // Split counters: remote (peers) and local-only (self)
+      uint64_t *remoteSignalCounter = combineSignalBuffer + i;
+      uint64_t *localOnlyCounter   = combineSignalLocalBuffer + i;
+
+      // Wait on sum(remote + local) == expertsPerToken
+      // Gate busy-wait to the first thread in the block
+      if (threadIdx.x == 0) {
+        device::nixl_wait_until_sum_eq(
+            remoteSignalCounter,
+            localOnlyCounter,
+            expertsPerToken
+        );
+      }
       __syncthreads();
-      combineSignalBuffer[i] = 0;
+
+      if (threadIdx.x == 0) {
+        uint64_t zero = 0ull;
+        pplx::st_flag_release(remoteSignalCounter, 0ull);
+        __nv_atomic_store(localOnlyCounter, &zero, __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
+      }
+      __syncthreads();
 
       U *dstPtr = outTokens + i * outTokensStrideElem;
       constexpr unsigned VEC_SIZE = 8;
@@ -136,8 +226,17 @@ __global__ __launch_bounds__(NUM_WARPS * 32, 1) void combineKernel(
 
     for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < worldSize;
          i += gridDim.x * blockDim.x) {
-      nvshmem_uint64_wait_until(&combineSyncBuffer[i], NVSHMEM_CMP_EQ, 1);
-      combineSyncBuffer[i] = 0;
+      uint64_t *remoteSyncCounter = combineSyncBuffer + i;
+      uint64_t *localSyncCounter = combineSyncLocalBuffer + i;
+
+      device::nixl_wait_until_sum_eq(
+          remoteSyncCounter,
+          localSyncCounter,
+          1);
+
+      uint64_t zero = 0ull;
+      pplx::st_flag_release(remoteSyncCounter, 0ull);
+      __nv_atomic_store(localSyncCounter, &zero, __NV_ATOMIC_RELEASE, PPLX_ATOMIC_SCOPE);
     }
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -169,6 +268,15 @@ void AllToAllInterNode::combine(
   dim3 dimGrid(numBlocks, 1, 1);
   dim3 dimBlock(NUM_WARPS * 32, 1, 1);
 
+  uint64_t *combineSignalBufferArg = combineSignalBuffer;
+  uint64_t *combineSyncBufferArg = combineSyncBuffer;
+  PPLX_ASSERT(combineSignalBuffer != nullptr, "NIXL combine remote signal buffer not initialized");
+  PPLX_ASSERT(combineSyncBuffer != nullptr, "NIXL combine remote sync buffer not initialized");
+  PPLX_ASSERT(combineLocalSignalBuffer != nullptr, "NIXL combine local signal buffer not initialized");
+  PPLX_ASSERT(combineLocalSyncBuffer != nullptr, "NIXL combine local sync buffer not initialized");
+  uint64_t *combineSignalLocalBufferArg = combineLocalSignalBuffer;
+  uint64_t *combineSyncLocalBufferArg = combineLocalSyncBuffer;
+
   void *args[] = {
       const_cast<U **>(&outTokens.data),
       const_cast<size_t *>(&outTokens.strideElem),
@@ -194,11 +302,21 @@ void AllToAllInterNode::combine(
       &sourceIndex,
       &sourceOffset,
       &sourceGroup,
-      &combineSignalBuffer,
-      &combineSyncBuffer,
+
+      &combineSignalBufferArg,
+      &combineSignalLocalBufferArg,
+      &combineSyncBufferArg,
+      &combineSyncLocalBufferArg,
       &tokenIndex,
       &xCombineIn,
-      &xCombineOut};
+      &xCombineOut,
+      &memLayout,
+      &peerDataBases,
+      &peerCounterBases,
+      const_cast<size_t*>(&numChannels),
+      &dChannelDataReqsFlat,
+      &dChannelSignalReqsFlat,
+  };
 
   nvtxRangePush("combine");
   switch (splitMode) {

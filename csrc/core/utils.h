@@ -3,6 +3,7 @@
 #include "core/common_utils.h"
 
 #include <unistd.h>
+#include <cstddef>
 
 #define _PPLX_ASSERT_MSG(msg)                                                                      \
   do {                                                                                             \
@@ -22,3 +23,7 @@
 #define PPLX_UNREACHABLE(msg)                                                                      \
   _PPLX_ASSERT_MSG(__FILE__ "(" _PPLX_EXPAND_AND_STRINGIFY(__LINE__) "): " msg "\n");              \
   __builtin_trap();
+
+namespace pplx {
+
+} // namespace pplx
