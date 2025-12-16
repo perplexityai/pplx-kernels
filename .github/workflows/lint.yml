@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Ruff check
         uses: astral-sh/ruff-action@v2
         with:
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Mypy
         run: |
           python3 -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Clang format
         run: |
           find csrc -type f -regex '.*\.\(h\|cpp\|cuh\|cu\)' -exec clang-format-16 --dry-run -Werror {} +
