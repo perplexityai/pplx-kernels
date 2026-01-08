@@ -74,7 +74,7 @@ RankTestData<T>::RankTestData(
     std::uniform_real_distribution<> weight(0.0f, 1.0f);
     for (size_t j = 0; j < expertsPerToken; ++j) {
       uint32_t expert = experts[j];
-      uint32_t loc = numRouted[expert]++;
+      numRouted[expert]++;
       indices[i * expertsPerToken + j] = expert;
       weights[i * expertsPerToken + j] = weight(gen);
     }
